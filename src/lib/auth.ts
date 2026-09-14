@@ -68,35 +68,51 @@ export async function destroySession(request: Request): Promise<void> {
   await storage.deleteSession(hashToken(token));
 }
 
-// Returns the session user or null; API routes use this as the auth gate.
+// Returns the session's actual user or null; API routes use this as the auth
+// gate. Multi-user: the session stores the user id, so look THAT user up.
 export async function requireUser(request: Request) {
   const id = await getSessionUserId(request);
   if (id == null) return null;
   const storage = await getStorage();
-  return storage.getUser();
+  return storage.getUserById(id);
 }
+
+// ---- sign-up validation (shared by /api/auth/signup) ----
+// 3–32 chars, starts alphanumeric; then letters, digits, dot, dash, underscore.
+export const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/;
 
 // ---- light rate limiting (in-memory; resets on server restart) ----
-// 5 consecutive failures lock login for 5 minutes. Single-user app, so one
-// global counter is sufficient and avoids storing attacker data in the DB.
+// 5 consecutive failures lock THAT username's login for 5 minutes. Multi-user
+// now, so the counter is per-username (lowercased) — one rep fat-fingering
+// their password never locks the owner out. Blank-username logins (the legacy
+// owner flow) share one "(blank)" key so they can't be used to brute the
+// first account either.
 const MAX_FAILURES = 5;
 const LOCK_MS = 5 * 60 * 1000;
-const state = { failures: 0, lockedUntil: 0 };
+const lockouts = new Map<string, { failures: number; lockedUntil: number }>();
 
-export function loginLockRemainingSec(): number {
-  if (state.lockedUntil <= Date.now()) return 0;
-  return Math.ceil((state.lockedUntil - Date.now()) / 1000);
+function lockKey(username?: string | null): string {
+  const u = (username ?? "").trim().toLowerCase();
+  return u || "(blank)";
 }
 
-export function recordLoginFailure(): void {
-  state.failures += 1;
-  if (state.failures >= MAX_FAILURES) {
-    state.lockedUntil = Date.now() + LOCK_MS;
-    state.failures = 0;
+export function loginLockRemainingSec(username?: string | null): number {
+  const entry = lockouts.get(lockKey(username));
+  if (!entry || entry.lockedUntil <= Date.now()) return 0;
+  return Math.ceil((entry.lockedUntil - Date.now()) / 1000);
+}
+
+export function recordLoginFailure(username?: string | null): void {
+  const key = lockKey(username);
+  const entry = lockouts.get(key) ?? { failures: 0, lockedUntil: 0 };
+  entry.failures += 1;
+  if (entry.failures >= MAX_FAILURES) {
+    entry.lockedUntil = Date.now() + LOCK_MS;
+    entry.failures = 0;
   }
+  lockouts.set(key, entry);
 }
 
-export function recordLoginSuccess(): void {
-  state.failures = 0;
-  state.lockedUntil = 0;
+export function recordLoginSuccess(username?: string | null): void {
+  lockouts.delete(lockKey(username));
 }

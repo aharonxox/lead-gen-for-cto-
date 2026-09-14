@@ -1,29 +1,51 @@
-import { neon } from "@neondatabase/serverless";
+import postgres from "postgres";
 
 /**
- * Server-only handle to the team's database (Neon serverless Postgres over HTTP).
+ * Server-only handle to the team's database over standard Postgres TCP
+ * (postgres.js — works with Supabase pooler hosts, Neon, RDS, any Postgres).
  * The connection string comes from `DATABASE_URL`, which the owner connects via
  * the database card and which is injected into the sandbox and passed to the live
  * host on publish. Resolved lazily (per call, not at module load) so the site
  * still builds and serves before a database is connected — the error only
  * surfaces if a query actually runs without `DATABASE_URL`.
  *
+ * postgres.js hands back a connection POOL, so the handle is cached per
+ * connection string — never construct one per query.
+ *
  * Use it only inside a `createServerFn()` handler or an `src/routes/api/*` route
  * (never client code):
  *
  *   const getPosts = createServerFn().handler(async () => {
- *     const rows = await sql()`select id, title, created_at from posts`;
- *     // Coerce non-primitive columns (timestamps are JS Dates) to strings before
- *     // returning to the client, or React will refuse to render them:
- *     return rows.map((r) => ({ ...r, created_at: String(r.created_at) }));
+ *     const db = sql();
+ *     const rows = await db`select id, title, created_at from posts`;
+ *     // Timestamps arrive as JS Dates — ./lib/storage/pg.ts coerces them to
+ *     // strings before anything goes to the client (React won't render Dates).
+ *     return rows;
  *   });
  */
-export const sql = () => {
+let cached: postgres.Sql | null = null;
+let cachedUrl: string | null = null;
+
+export const sql = (): postgres.Sql => {
   const url = process.env.DATABASE_URL;
   if (!url) {
     throw new Error(
-      "DATABASE_URL is not set — connect a database (via the database card) before running queries."
+      "DATABASE_URL is not set — connect a database (via the database card) before running queries.",
     );
   }
-  return neon(url);
+  if (cached && cachedUrl === url) return cached;
+  // Transaction-poolers (Supabase Supavisor / PgBouncer) can't do named
+  // prepared statements — disable them when the host smells like a pooler.
+  const pooled = /pooler|pgbouncer|supavisor|supabase/i.test(url);
+  cached = postgres(url, {
+    // "prefer" negotiates SSL when the server supports it (Supabase requires
+    // it) and still connects to local Postgres without TLS.
+    ssl: /sslmode=disable/i.test(url) ? false : "prefer",
+    prepare: pooled ? false : undefined,
+    connect_timeout: 10,
+    idle_timeout: 25,
+    max: 10,
+  });
+  cachedUrl = url;
+  return cached;
 };

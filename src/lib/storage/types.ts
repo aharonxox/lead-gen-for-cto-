@@ -26,6 +26,10 @@ export interface Storage {
     passwordHash: string,
   ): { id: number; username: string } | Promise<{ id: number; username: string }>;
   getUser(): StorageUser | null | Promise<StorageUser | null>;
+  getUserByUsername(
+    username: string,
+  ): StorageUser | null | Promise<StorageUser | null>;
+  getUserById(id: number): StorageUser | null | Promise<StorageUser | null>;
   createSession(tokenHash: string, userId: number, expiresAt: Date): void | Promise<void>;
   getSession(
     tokenHash: string,

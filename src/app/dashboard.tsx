@@ -60,7 +60,13 @@ function fmtTime(iso: string | null): string {
   });
 }
 
-export default function Dashboard({ onLogout }: { onLogout: () => void }) {
+export default function Dashboard({
+  onLogout,
+  username,
+}: {
+  onLogout: () => void;
+  username?: string | null;
+}) {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -601,6 +607,12 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           >
             Product Cheat-Sheet
           </button>
+          <span
+            title="Every signed-up teammate shares this one pipeline"
+            className="text-sm text-gray-500"
+          >
+            Signed in as <b className="text-[#1f2937]">{username ?? "owner"}</b>
+          </span>
           <button
             onClick={doLogout}
             className="rounded-md bg-gray-200 px-4 py-2.5 text-sm font-bold text-[#374151]"

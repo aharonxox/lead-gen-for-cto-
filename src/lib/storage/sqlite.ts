@@ -152,6 +152,27 @@ export class SQLiteStorage implements Storage {
     return { id: row.id, username: row.username, passwordHash: row.password_hash };
   }
 
+  getUserByUsername(username: string) {
+    this.ensureSchema();
+    // Case-insensitive: logins shouldn't hinge on caps.
+    const row = this.db
+      .prepare(
+        "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+      )
+      .get(username) as { id: number; username: string; password_hash: string } | undefined;
+    if (!row) return null;
+    return { id: row.id, username: row.username, passwordHash: row.password_hash };
+  }
+
+  getUserById(id: number) {
+    this.ensureSchema();
+    const row = this.db
+      .prepare("SELECT id, username, password_hash FROM users WHERE id = ? LIMIT 1")
+      .get(id) as { id: number; username: string; password_hash: string } | undefined;
+    if (!row) return null;
+    return { id: row.id, username: row.username, passwordHash: row.password_hash };
+  }
+
   createSession(tokenHash: string, userId: number, expiresAt: Date): void {
     this.ensureSchema();
     this.db

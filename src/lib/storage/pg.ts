@@ -1,10 +1,13 @@
-// Postgres storage backend — used whenever DATABASE_URL is present (Neon
-// serverless Postgres over HTTP via the existing ~/db helper). This is the
-// path team hosting and Vercel use once the owner connects a database.
+// Postgres storage backend — used whenever DATABASE_URL is present. Talks
+// standard Postgres TCP via postgres.js (~/db), so it works with Supabase
+// pooler hosts, Neon, RDS — any Postgres. This is the path team hosting and
+// Vercel use once the owner connects a database.
 //
-// Same Storage contract as the SQLite fallback; see ./index.ts for selection.
+// Same Storage contract as the SQLite fallback; see ./index.ts for selection
+// and for the SQLite fallback that keeps the app up when Postgres can't be
+// reached (paused Supabase project, bad connection string, network down).
 
-import { sql as neonSql } from "~/db";
+import { sql } from "~/db";
 import type {
   CallEntry,
   CallOutcome,
@@ -18,18 +21,27 @@ import type { Storage, StorageUser } from "./types";
 
 type Row = Record<string, unknown>;
 
+// postgres.js parses timestamp/timestamptz/date columns into JS Date objects;
+// React refuses to render Dates, so coerce every Date cell to an ISO string
+// before rows leave this class. All row mappers below accept strings.
+function stringifyDates(rows: Row[]): Row[] {
+  for (const r of rows) {
+    for (const k of Object.keys(r)) {
+      if (r[k] instanceof Date) r[k] = (r[k] as Date).toISOString();
+    }
+  }
+  return rows;
+}
+
 export class PostgresStorage implements Storage {
   readonly kind = "postgres" as const;
 
   private async q(text: string, params: unknown[] = []): Promise<Row[]> {
-    const db = neonSql();
-    // neon()'s TS surface is the tagged-template form; the array call form
-    // (query, params) is supported at runtime — cast for the type checker.
-    const query = db as unknown as (
-      text: string,
-      params: unknown[],
-    ) => Promise<Row[]>;
-    return await query(text, params);
+    const db = sql();
+    // unsafe() is postgres.js's documented dynamic-query form (query + params).
+    return stringifyDates(
+      (await db.unsafe(text, params as never[])) as Row[],
+    );
   }
 
   private async one(text: string, params: unknown[] = []): Promise<Row | undefined> {
@@ -121,6 +133,35 @@ export class PostgresStorage implements Storage {
     await this.ensureSchema();
     const row = await this.one(
       "SELECT id, username, password_hash FROM users ORDER BY id LIMIT 1",
+    );
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      username: String(row.username),
+      passwordHash: String(row.password_hash),
+    };
+  }
+
+  async getUserByUsername(username: string): Promise<StorageUser | null> {
+    await this.ensureSchema();
+    // Case-insensitive: logins shouldn't hinge on caps.
+    const row = await this.one(
+      "SELECT id, username, password_hash FROM users WHERE lower(username) = lower($1) LIMIT 1",
+      [username],
+    );
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      username: String(row.username),
+      passwordHash: String(row.password_hash),
+    };
+  }
+
+  async getUserById(id: number): Promise<StorageUser | null> {
+    await this.ensureSchema();
+    const row = await this.one(
+      "SELECT id, username, password_hash FROM users WHERE id = $1 LIMIT 1",
+      [id],
     );
     if (!row) return null;
     return {
