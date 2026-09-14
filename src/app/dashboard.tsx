@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BRAND, BRAND_TAGLINE } from "~/lib/brand";
-import { SCRIPT_SECTIONS } from "~/lib/scripts";
 import {
   CALL_OUTCOMES,
   OUTCOME_LABELS,
@@ -9,9 +8,12 @@ import {
   type CallOutcome,
   type Lead,
   type LeadStatus,
+  type PipelineMetrics,
   type SearchPairState,
   type Stats,
 } from "~/lib/types";
+import LibraryModal, { type LibraryTab } from "~/app/library-modal";
+import ImportPanel from "~/app/import-panel";
 
 interface Bootstrap {
   leads: Lead[];
@@ -73,8 +75,17 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
-  const [showScripts, setShowScripts] = useState(false);
+  const [metrics, setMetrics] = useState<PipelineMetrics | null>(null);
+  const [libraryTab, setLibraryTab] = useState<LibraryTab | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Today's date in the CALLER's calendar (YYYY-MM-DD) — the follow-up queue
+  // and overdue highlighting run off this, so day boundaries are the owner's,
+  // not the server's.
+  const todayKey = useMemo(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }, []);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [calls, setCalls] = useState<Record<string, CallEntry[]>>({});
@@ -84,28 +95,46 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
 
   const noteInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch("/api/bootstrap");
-        if (res.status === 401) {
-          onLogout();
-          return;
-        }
-        const payload = (await res.json()) as Bootstrap;
-        setData(payload);
-        setLeads(payload.leads);
-        setStats(payload.stats);
-        const pm: Record<string, SearchPairState> = {};
-        for (const p of payload.pairs) pm[`${p.city}|${p.keyword}`] = p;
-        setPairMap(pm);
-        setSelCities(new Set(payload.cities));
-        setSelKeywords(new Set(payload.keywords));
-      } catch {
-        setLoadError("Could not load the dashboard — refresh to retry.");
+  const loadBootstrap = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bootstrap");
+      if (res.status === 401) {
+        onLogout();
+        return;
       }
-    })();
+      const payload = (await res.json()) as Bootstrap;
+      setData(payload);
+      setLeads(payload.leads);
+      setStats(payload.stats);
+      const pm: Record<string, SearchPairState> = {};
+      for (const p of payload.pairs) pm[`${p.city}|${p.keyword}`] = p;
+      setPairMap(pm);
+      setSelCities(new Set(payload.cities));
+      setSelKeywords(new Set(payload.keywords));
+    } catch {
+      setLoadError("Could not load the dashboard — refresh to retry.");
+    }
   }, [onLogout]);
+
+  // Caller's scoreboard — server-computed; ?tz shifts "today" to the caller's
+  // calendar. Fire-and-forget: never blocks a call action.
+  const refreshMetrics = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/metrics?tz=${encodeURIComponent(String(new Date().getTimezoneOffset()))}`,
+      );
+      if (!res.ok) return;
+      const payload = (await res.json()) as { metrics?: PipelineMetrics };
+      if (payload.metrics) setMetrics(payload.metrics);
+    } catch {
+      // scoreboard lag is acceptable; the next action refreshes it
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadBootstrap();
+    void refreshMetrics();
+  }, [loadBootstrap, refreshMetrics]);
 
   // Auto-clear the flash line so the stats bar area stays quiet while calling.
   useEffect(() => {
@@ -118,6 +147,28 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
     if (!leads) return [];
     return filter === "all" ? leads : leads.filter((l) => l.status === filter);
   }, [leads, filter]);
+
+  // Follow-up queue (yellow leads with a call-back date), due-or-overdue
+  // first, sorted by date. Computed client-side so the panel is instant.
+  const followUpYellow = useMemo(
+    () => leads.filter((l) => l.status === "yellow"),
+    [leads],
+  );
+  const dueFollowUps = useMemo(() => {
+    return followUpYellow
+      .filter((l) => l.followUpOn != null && l.followUpOn <= todayKey)
+      .sort((a, b) => (a.followUpOn ?? "").localeCompare(b.followUpOn ?? ""));
+  }, [followUpYellow, todayKey]);
+  const upcomingFollowUpCount = useMemo(
+    () =>
+      followUpYellow.filter((l) => l.followUpOn != null && l.followUpOn > todayKey)
+        .length,
+    [followUpYellow, todayKey],
+  );
+  const undatedFollowUps = useMemo(
+    () => followUpYellow.filter((l) => l.followUpOn == null).length,
+    [followUpYellow],
+  );
 
   const exhaustedList = useMemo(() => {
     return Object.values(pairMap)
@@ -216,12 +267,42 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
       const payload = (await res.json()) as { stats?: Stats; error?: string };
       if (!res.ok) throw new Error(payload.error ?? "failed");
       if (payload.stats) setStats(payload.stats);
+      void refreshMetrics();
     } catch {
       setLeads((prev) =>
         prev.map((l) => (l.id === lead.id ? { ...l, status: prevStatus } : l)),
       );
       setError("Could not save the status — check your connection.");
     }
+  }
+
+  // "Call back on" date — optimistic like everything else; the queue and the
+  // scoreboard re-derive from the updated lead.
+  async function saveFollowUp(lead: Lead, followUpOn: string | null) {
+    const prevDate = lead.followUpOn;
+    setLeads((prev) =>
+      prev.map((l) => (l.id === lead.id ? { ...l, followUpOn } : l)),
+    );
+    try {
+      const res = await fetch(`/api/leads/${lead.id}/followup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ followUpOn }),
+      });
+      if (!res.ok) throw new Error("failed");
+      void refreshMetrics();
+    } catch {
+      setLeads((prev) =>
+        prev.map((l) => (l.id === lead.id ? { ...l, followUpOn: prevDate } : l)),
+      );
+      setError("Could not save the follow-up date — check your connection.");
+    }
+  }
+
+  function shiftDate(dateStr: string, days: number): string {
+    const d = new Date(`${dateStr}T00:00:00`);
+    d.setDate(d.getDate() + days);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
 
   async function logCall(leadId: string, outcome: CallOutcome, note: string) {
@@ -256,6 +337,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
         ),
       );
       if (payload.stats) setStats(payload.stats);
+      void refreshMetrics();
       setCalls((prev) => ({ ...prev, [leadId]: [call, ...(prev[leadId] ?? [])] }));
       setNoteDraft((prev) => ({ ...prev, [leadId]: "" }));
       noteInputRefs.current[leadId]?.focus();
@@ -373,6 +455,45 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           ↺
         </button>
       )}
+      {lead.status === "yellow" && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <label
+            className="text-[11px] font-bold uppercase tracking-wide text-[#92400e]"
+            title="The lead lands in Today's Follow-ups on this date"
+          >
+            Call back on
+          </label>
+          <input
+            type="date"
+            value={lead.followUpOn ?? ""}
+            onChange={(e) => void saveFollowUp(lead, e.target.value || null)}
+            className="rounded border border-[#f59e0b] bg-white px-1.5 py-1 text-xs"
+          />
+          <button
+            onClick={() => void saveFollowUp(lead, shiftDate(todayKey, 1))}
+            title="Call back tomorrow"
+            className="rounded border border-gray-300 bg-white px-1.5 py-1 text-xs font-bold text-gray-600 hover:bg-gray-50"
+          >
+            +1d
+          </button>
+          <button
+            onClick={() => void saveFollowUp(lead, shiftDate(todayKey, 7))}
+            title="Call back in one week"
+            className="rounded border border-gray-300 bg-white px-1.5 py-1 text-xs font-bold text-gray-600 hover:bg-gray-50"
+          >
+            +1w
+          </button>
+          {lead.followUpOn && (
+            <button
+              onClick={() => void saveFollowUp(lead, null)}
+              title="Clear the call-back date"
+              className="rounded border border-gray-300 bg-white px-1.5 py-1 text-xs font-bold text-gray-600 hover:bg-gray-50"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 
@@ -447,7 +568,21 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             {filtered.length} | Dials Today: {stats.dialsToday}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <a
+            href="/api/export/leads"
+            title="Download every lead with status, follow-up date and notes as CSV"
+            className="rounded-md border border-gray-300 bg-white px-3 py-2.5 text-sm font-bold text-[#374151] hover:bg-gray-50"
+          >
+            ⬇ Leads CSV
+          </a>
+          <a
+            href="/api/export/calls"
+            title="Download the full call history as CSV"
+            className="rounded-md border border-gray-300 bg-white px-3 py-2.5 text-sm font-bold text-[#374151] hover:bg-gray-50"
+          >
+            ⬇ Call Log CSV
+          </a>
           <button
             onClick={() => setSettingsOpen(true)}
             className="rounded-md bg-[#374151] px-4 py-2.5 text-sm font-bold text-white"
@@ -455,10 +590,16 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             Settings{data.placesKeySet ? "" : " ⚠"}
           </button>
           <button
-            onClick={() => setShowScripts((s) => !s)}
-            className="rounded-md bg-[#374151] px-4 py-2.5 text-sm font-bold text-white"
+            onClick={() => setLibraryTab("scripts")}
+            className="rounded-md bg-[#7c2d12] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#9a3412]"
           >
-            Script & Objections
+            Script Library
+          </button>
+          <button
+            onClick={() => setLibraryTab("products")}
+            className="rounded-md bg-[#7c2d12] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#9a3412]"
+          >
+            Product Cheat-Sheet
           </button>
           <button
             onClick={doLogout}
@@ -476,6 +617,140 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
       </div>
 
+      {/* Caller's scoreboard — server-computed pipeline metrics */}
+      {metrics && (
+        <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <MetricTile label="Dials Today" value={String(metrics.dialsToday)} />
+          <MetricTile label="Dials This Week" value={String(metrics.dialsWeek)} />
+          <MetricTile
+            label="Connect Rate Today"
+            value={metrics.connectRateToday == null ? "—" : `${Math.round(metrics.connectRateToday * 100)}%`}
+            sub={`${metrics.connectsToday}/${metrics.dialsToday} connected`}
+          />
+          <MetricTile
+            label="Connect Rate Week"
+            value={metrics.connectRateWeek == null ? "—" : `${Math.round(metrics.connectRateWeek * 100)}%`}
+            sub={`${metrics.connectsWeek}/${metrics.dialsWeek} connected`}
+          />
+          <MetricTile
+            label="Conversion"
+            value={metrics.conversion == null ? "—" : `${Math.round(metrics.conversion * 100)}%`}
+            sub={`${metrics.counts.green} clients / ${metrics.worked} worked`}
+          />
+          <MetricTile
+            label="Follow-ups Due"
+            value={String(metrics.followUpsDue)}
+            sub={
+              metrics.followUpsOverdue > 0
+                ? `${metrics.followUpsOverdue} overdue`
+                : "none overdue"
+            }
+            tone={metrics.followUpsOverdue > 0 ? "alert" : metrics.followUpsDue > 0 ? "warn" : "ok"}
+          />
+        </div>
+      )}
+
+      {/* Today's follow-ups — the first thing the caller sees, no click needed */}
+      <div className="mb-5 rounded-xl bg-white p-4 shadow-sm">
+        <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+          <h2 className="m-0 text-base font-bold">
+            Today's Follow-ups{" "}
+            <span
+              className={`ml-1 rounded-full px-2 py-0.5 text-xs font-bold ${
+                dueFollowUps.length > 0
+                  ? "bg-[#fde68a] text-[#92400e]"
+                  : "bg-gray-100 text-gray-500"
+              }`}
+            >
+              {dueFollowUps.length}
+            </span>
+          </h2>
+          <span className="text-xs text-gray-500">
+            {undatedFollowUps > 0
+              ? `${undatedFollowUps} follow-up lead${undatedFollowUps === 1 ? "" : "s"} without a call-back date — set one in its row`
+              : "Every yellow lead has a call-back date."}
+            {upcomingFollowUpCount > 0 &&
+              ` · ${upcomingFollowUpCount} scheduled for later`}
+          </span>
+        </div>
+        {dueFollowUps.length === 0 ? (
+          <p className="m-0 text-sm text-gray-400">
+            Nothing due today. Mark a lead{" "}
+            <span className="font-semibold text-[#b45309]">Follow Up</span> and
+            pick a "call back on" date — it shows up here.
+          </p>
+        ) : (
+          <ul className="m-0 list-none space-y-1.5 p-0">
+            {dueFollowUps.slice(0, 8).map((lead) => {
+              const overdue = (lead.followUpOn ?? "") < todayKey;
+              return (
+                <li
+                  key={lead.id}
+                  className={`flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border p-2 text-sm ${
+                    overdue
+                      ? "border-[#fca5a5] bg-[#fef2f2]"
+                      : "border-[#fde68a] bg-[#fffbeb]"
+                  }`}
+                >
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-xs font-bold ${
+                      overdue
+                        ? "bg-[#dc2626] text-white"
+                        : "bg-[#f59e0b] text-black"
+                    }`}
+                  >
+                    {overdue ? "OVERDUE" : "TODAY"}
+                  </span>
+                  {overdue && (
+                    <span className="text-xs font-bold text-[#991b1b]">
+                      {lead.followUpOn}
+                    </span>
+                  )}
+                  <strong>{lead.name}</strong>
+                  {lead.phone ? (
+                    <a
+                      href={`tel:${lead.phone}`}
+                      className="font-bold text-[#2563eb] hover:underline"
+                    >
+                      {lead.phone}
+                    </a>
+                  ) : (
+                    <span className="text-gray-400">no phone</span>
+                  )}
+                  {lead.lastNote && (
+                    <span className="min-w-0 flex-1 truncate text-xs text-gray-500">
+                      Last: {lead.lastNote}
+                    </span>
+                  )}
+                  <button
+                    onClick={() =>
+                      void saveFollowUp(lead, shiftDate(lead.followUpOn ?? todayKey, 1))
+                    }
+                    title="Push the call-back date to tomorrow"
+                    className="rounded border border-gray-300 bg-white px-2 py-1 text-xs font-bold text-gray-600 hover:bg-gray-50"
+                  >
+                    +1d
+                  </button>
+                  <button
+                    onClick={() => void saveFollowUp(lead, null)}
+                    title="Clear the call-back date"
+                    className="rounded border border-gray-300 bg-white px-2 py-1 text-xs font-bold text-gray-600 hover:bg-gray-50"
+                  >
+                    Clear
+                  </button>
+                </li>
+              );
+            })}
+            {dueFollowUps.length > 8 && (
+              <li className="text-xs text-gray-500">
+                + {dueFollowUps.length - 8} more due — keep working down the
+                list.
+              </li>
+            )}
+          </ul>
+        )}
+      </div>
+
       {/* Key banner */}
       {!data.placesKeySet && (
         <div className="mb-5 rounded-xl border border-[#bfdbfe] bg-[#eff6ff] p-4 text-sm">
@@ -488,20 +763,6 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           </button>{" "}
           to start fetching. The key is stored server-side, requests are proxied
           through this app's server, and it is only ever shown masked afterwards.
-        </div>
-      )}
-
-      {/* Script drawer */}
-      {showScripts && (
-        <div className="mb-5 rounded-xl border border-[#bfdbfe] bg-[#eff6ff] p-5 text-sm">
-          <h3 className="m-0 mb-2 font-bold text-[#1e40af]">
-            {BRAND} Pitch Cheatsheet
-          </h3>
-          {SCRIPT_SECTIONS.map((s) => (
-            <p key={s.title} className="mb-2">
-              <strong>{s.title}:</strong> {s.lines[0]}
-            </p>
-          ))}
         </div>
       )}
 
@@ -667,6 +928,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
               <LeadRow
                 key={lead.id}
                 lead={lead}
+                todayKey={todayKey}
                 expanded={expandedId === lead.id}
                 calls={calls[lead.id] ?? []}
                 onExpand={() => void toggleExpand(lead.id)}
@@ -684,14 +946,58 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           isSet={data.placesKeySet}
           onClose={() => setSettingsOpen(false)}
           onSave={saveSettingsKey}
+          onImported={() => {
+            void loadBootstrap();
+            void refreshMetrics();
+          }}
+        />
+      )}
+
+      {libraryTab && (
+        <LibraryModal
+          tab={libraryTab}
+          onTab={setLibraryTab}
+          onClose={() => setLibraryTab(null)}
         />
       )}
     </div>
   );
 }
 
+// One small scoreboard tile — big number, tiny label, optional sub-line.
+function MetricTile({
+  label,
+  value,
+  sub,
+  tone,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: "ok" | "warn" | "alert";
+}) {
+  const toneClass =
+    tone === "alert"
+      ? "border-[#fca5a5] bg-[#fef2f2]"
+      : tone === "warn"
+        ? "border-[#fde68a] bg-[#fffbeb]"
+        : "border-gray-200 bg-white";
+  return (
+    <div className={`rounded-lg border p-3 shadow-sm ${toneClass}`}>
+      <div className="text-xs font-bold uppercase tracking-wide text-gray-500">
+        {label}
+      </div>
+      <div className="text-2xl font-bold leading-tight text-[#111827]">
+        {value}
+      </div>
+      {sub && <div className="text-xs text-gray-500">{sub}</div>}
+    </div>
+  );
+}
+
 function LeadRow({
   lead,
+  todayKey,
   expanded,
   calls,
   onExpand,
@@ -699,17 +1005,44 @@ function LeadRow({
   quickNoteCell,
 }: {
   lead: Lead;
+  todayKey: string;
   expanded: boolean;
   calls: CallEntry[];
   onExpand: () => void;
   statusCell: React.ReactNode;
   quickNoteCell: React.ReactNode;
 }) {
+  const followUpState =
+    lead.status === "yellow" && lead.followUpOn
+      ? lead.followUpOn < todayKey
+        ? "overdue"
+        : lead.followUpOn === todayKey
+          ? "today"
+          : "later"
+      : null;
   return (
     <>
       <tr className={`${ROW_BG[lead.status] ?? ""} border-b border-gray-200`}>
         <td className="p-4 align-top text-sm">
           <strong>{lead.name}</strong>
+          {followUpState && (
+            <span
+              className={`ml-1.5 inline-block rounded px-1.5 py-0.5 align-middle text-[10px] font-bold ${
+                followUpState === "overdue"
+                  ? "bg-[#dc2626] text-white"
+                  : followUpState === "today"
+                    ? "bg-[#f59e0b] text-black"
+                    : "bg-gray-200 text-gray-600"
+              }`}
+              title={`Call back on ${lead.followUpOn}`}
+            >
+              {followUpState === "overdue"
+                ? "CALL BACK OVERDUE"
+                : followUpState === "today"
+                  ? "CALL BACK TODAY"
+                  : `CALL BACK ${lead.followUpOn}`}
+            </span>
+          )}
           {lead.website && (
             <>
               <br />
@@ -759,6 +1092,16 @@ function LeadRow({
             <div className="mb-2 text-xs font-bold uppercase tracking-wide text-gray-500">
               Call history — {lead.name} ({STATUS_LABELS[lead.status]})
             </div>
+            {lead.status === "yellow" && (
+              <div className="mb-2 text-sm">
+                <span className="font-semibold text-[#92400e]">Call back on:</span>{" "}
+                {lead.followUpOn ?? (
+                  <span className="italic text-gray-400">
+                    no date set — pick one in the Set Status column
+                  </span>
+                )}
+              </div>
+            )}
             {calls.length === 0 ? (
               <div className="text-sm text-gray-400">
                 No calls logged yet. Type a note in the row above and press
@@ -792,11 +1135,13 @@ function SettingsModal({
   isSet,
   onClose,
   onSave,
+  onImported,
 }: {
   masked: string | null;
   isSet: boolean;
   onClose: () => void;
   onSave: (key: string) => Promise<string | null>;
+  onImported: () => void;
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -814,7 +1159,7 @@ function SettingsModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-      <div className="w-full max-w-[380px] rounded-xl bg-white p-[30px] shadow-2xl">
+      <div className="max-h-[88vh] w-full max-w-[520px] overflow-y-auto rounded-xl bg-white p-[30px] shadow-2xl">
         <h3 className="m-0 mb-1 text-lg font-bold">System Settings</h3>
         <label className="text-xs font-bold text-gray-500">
           Google Places API Key
@@ -859,6 +1204,8 @@ function SettingsModal({
           </div>
           {err && <p className="mt-2 text-sm text-red-600">{err}</p>}
         </form>
+
+        <ImportPanel onImported={onImported} />
       </div>
     </div>
   );
