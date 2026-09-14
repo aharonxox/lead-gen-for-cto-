@@ -1,8 +1,10 @@
 @import "tailwindcss";
 
+/* Light-only base matching the original CRM's palette — the green/yellow/red
+   status language must never be inverted by a dark scheme. */
 @layer base {
   html,
   body {
-    @apply bg-white text-gray-900 antialiased dark:bg-gray-950 dark:text-gray-100;
+    @apply bg-[#f3f4f6] text-[#1f2937] antialiased;
   }
 }
