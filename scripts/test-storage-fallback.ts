@@ -1,6 +1,7 @@
 // Resilience test for the storage layer (run: bun run scripts/test-storage-fallback.ts).
 // 1) DATABASE_URL set but unreachable at boot -> getStorage() serves SQLite.
 // 2) A wrapped PostgresStorage failing mid-run -> proxy degrades to SQLite.
+export {};
 process.env.DATABASE_URL = "postgres://u:p@127.0.0.1:59999/db"; // nothing listens here
 process.env.SQLITE_PATH = "/tmp/pb-fallback-test.db";
 
