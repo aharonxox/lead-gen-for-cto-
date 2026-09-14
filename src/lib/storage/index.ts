@@ -46,8 +46,8 @@ async function resolveStorage(): Promise<Storage> {
 
 // Wraps every method of the Postgres backend: on a connection-class failure it
 // logs once, switches to SQLite for the rest of the process lifetime, and
-// re-runs the same call there.
-function withSqliteFallback(pg: PostgresStorage): Storage {
+// re-runs the same call there. Exported for the resilience test script.
+export function withSqliteFallback(pg: PostgresStorage): Storage {
   let fallback: SQLiteStorage | null = null;
   let degraded = false;
 
