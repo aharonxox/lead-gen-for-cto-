@@ -71,6 +71,7 @@ export class SQLiteStorage implements Storage {
         website TEXT,
         status TEXT NOT NULL DEFAULT 'new'
           CHECK (status IN ('new','green','yellow','red')),
+        follow_up_on TEXT,
         seq INTEGER,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -101,6 +102,14 @@ export class SQLiteStorage implements Storage {
         PRIMARY KEY (city, keyword)
       );
     `);
+    // Phase 2 migration: "call back on" date per lead. Older databases created
+    // before this column existed get it via ALTER; SQLite's ADD COLUMN has no
+    // IF NOT EXISTS, so a duplicate-column error simply means it's already there.
+    try {
+      this.db.exec("ALTER TABLE leads ADD COLUMN follow_up_on TEXT");
+    } catch {
+      // column already exists
+    }
     this.schemaReady = true;
   }
 
@@ -200,6 +209,7 @@ export class SQLiteStorage implements Storage {
       phone: (r.phone as string) ?? null,
       website: (r.website as string) ?? null,
       status: r.status as LeadStatus,
+      followUpOn: (r.follow_up_on as string) ?? null,
       createdAt: this.iso(r.created_at) as string,
       callCount: Number(r.call_count ?? 0),
       lastCallAt: this.iso(r.last_call_at),
@@ -207,11 +217,24 @@ export class SQLiteStorage implements Storage {
     };
   }
 
-  updateLeadStatus(id: string, status: LeadStatus): void {
+  updateLeadStatus(id: string, status: LeadStatus, followUpOn?: string | null): void {
+    this.ensureSchema();
+    if (followUpOn === undefined) {
+      this.db
+        .prepare("UPDATE leads SET status = ?, updated_at = ? WHERE id = ?")
+        .run(status, this.now(), id);
+    } else {
+      this.db
+        .prepare("UPDATE leads SET status = ?, follow_up_on = ?, updated_at = ? WHERE id = ?")
+        .run(status, followUpOn, this.now(), id);
+    }
+  }
+
+  setFollowUp(id: string, followUpOn: string | null): void {
     this.ensureSchema();
     this.db
-      .prepare("UPDATE leads SET status = ?, updated_at = ? WHERE id = ?")
-      .run(status, this.now(), id);
+      .prepare("UPDATE leads SET follow_up_on = ?, updated_at = ? WHERE id = ?")
+      .run(followUpOn, this.now(), id);
   }
 
   insertLeads(leads: NewLeadInput[]): Lead[] {
@@ -246,6 +269,7 @@ export class SQLiteStorage implements Storage {
           phone: l.phone,
           website: l.website,
           status: "new",
+          followUpOn: null,
           createdAt: now,
           callCount: 0,
           lastCallAt: null,
@@ -322,6 +346,22 @@ export class SQLiteStorage implements Storage {
         "SELECT id, lead_id, called_at, outcome, note FROM call_log WHERE lead_id = ? ORDER BY called_at DESC, id DESC",
       )
       .all(leadId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      leadId: String(r.lead_id),
+      at: this.iso(r.called_at) as string,
+      outcome: r.outcome as CallOutcome,
+      note: String(r.note ?? ""),
+    }));
+  }
+
+  listAllCalls(): CallEntry[] {
+    this.ensureSchema();
+    const rows = this.db
+      .prepare(
+        "SELECT id, lead_id, called_at, outcome, note FROM call_log ORDER BY called_at ASC, id ASC",
+      )
+      .all() as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       id: Number(r.id),
       leadId: String(r.lead_id),

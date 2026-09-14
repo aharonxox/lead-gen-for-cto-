@@ -69,6 +69,8 @@ export class PostgresStorage implements Storage {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
+    // Phase 2 migration: "call back on" date per lead.
+    await this.q("ALTER TABLE leads ADD COLUMN IF NOT EXISTS follow_up_on TEXT");
     await this.q(`CREATE TABLE IF NOT EXISTS call_log (
       id SERIAL PRIMARY KEY,
       lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -168,6 +170,7 @@ export class PostgresStorage implements Storage {
       phone: (r.phone as string) ?? null,
       website: (r.website as string) ?? null,
       status: r.status as LeadStatus,
+      followUpOn: (r.follow_up_on as string) ?? null,
       createdAt: this.iso(r.created_at) as string,
       callCount: Number(r.call_count ?? 0),
       lastCallAt: this.iso(r.last_call_at),
@@ -186,10 +189,25 @@ export class PostgresStorage implements Storage {
     return rows.map((r) => this.rowToLead(r));
   }
 
-  async updateLeadStatus(id: string, status: LeadStatus) {
+  async updateLeadStatus(id: string, status: LeadStatus, followUpOn?: string | null) {
     await this.ensureSchema();
-    await this.q("UPDATE leads SET status = $1, updated_at = now() WHERE id = $2", [
-      status,
+    if (followUpOn === undefined) {
+      await this.q("UPDATE leads SET status = $1, updated_at = now() WHERE id = $2", [
+        status,
+        id,
+      ]);
+    } else {
+      await this.q(
+        "UPDATE leads SET status = $1, follow_up_on = $2, updated_at = now() WHERE id = $3",
+        [status, followUpOn, id],
+      );
+    }
+  }
+
+  async setFollowUp(id: string, followUpOn: string | null) {
+    await this.ensureSchema();
+    await this.q("UPDATE leads SET follow_up_on = $1, updated_at = now() WHERE id = $2", [
+      followUpOn,
       id,
     ]);
   }
@@ -271,6 +289,20 @@ export class PostgresStorage implements Storage {
     const rows = await this.q(
       "SELECT id, lead_id, called_at, outcome, note FROM call_log WHERE lead_id = $1 ORDER BY called_at DESC, id DESC",
       [leadId],
+    );
+    return rows.map((r) => ({
+      id: Number(r.id),
+      leadId: String(r.lead_id),
+      at: this.iso(r.called_at) as string,
+      outcome: r.outcome as CallOutcome,
+      note: String(r.note ?? ""),
+    }));
+  }
+
+  async listAllCalls(): Promise<CallEntry[]> {
+    await this.ensureSchema();
+    const rows = await this.q(
+      "SELECT id, lead_id, called_at, outcome, note FROM call_log ORDER BY called_at ASC, id ASC",
     );
     return rows.map((r) => ({
       id: Number(r.id),

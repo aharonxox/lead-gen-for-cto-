@@ -38,6 +38,7 @@ export interface Lead {
   phone: string | null;
   website: string | null;
   status: LeadStatus;
+  followUpOn: string | null; // "call back on" date, YYYY-MM-DD (caller's local calendar)
   createdAt: string; // ISO string (safe for React rendering)
   callCount: number;
   lastCallAt: string | null;
@@ -65,6 +66,22 @@ export interface Stats {
   activeInPipeline: number; // leads not trashed
   counts: Record<LeadStatus, number>;
   dialsToday: number; // call_log entries since local midnight (server time)
+}
+
+// Caller's scoreboard — computed server-side from call_log + leads only
+// (Feasibility verdict item 7: no external analytics service).
+export interface PipelineMetrics {
+  dialsToday: number;
+  dialsWeek: number; // since Monday 00:00 (caller's tz via ?tz= offset)
+  connectsToday: number;
+  connectsWeek: number;
+  connectRateToday: number | null; // connected ÷ dials; null when no dials
+  connectRateWeek: number | null;
+  counts: Record<LeadStatus, number>;
+  worked: number; // leads with status != new OR at least one logged call
+  conversion: number | null; // green ÷ worked; null when nothing worked yet
+  followUpsDue: number; // yellow leads with call-back date <= today
+  followUpsOverdue: number; // date < today
 }
 
 export interface NewLeadInput {

@@ -34,7 +34,8 @@ export interface Storage {
 
   // leads
   listLeads(): Lead[] | Promise<Lead[]>;
-  updateLeadStatus(id: string, status: LeadStatus): void | Promise<void>;
+  updateLeadStatus(id: string, status: LeadStatus, followUpOn?: string | null): void | Promise<void>;
+  setFollowUp(id: string, followUpOn: string | null): void | Promise<void>;
   insertLeads(leads: NewLeadInput[]): Lead[] | Promise<Lead[]>;
   filterUnprocessed(placeIds: string[]): Promise<Set<string>>;
   markProcessed(placeIds: string[]): Promise<void>;
@@ -47,6 +48,7 @@ export interface Storage {
     at?: Date,
   ): CallEntry | Promise<CallEntry>;
   listCalls(leadId: string): CallEntry[] | Promise<CallEntry[]>;
+  listAllCalls(): CallEntry[] | Promise<CallEntry[]>;
 
   // settings (places key, future app settings)
   getSetting(key: string): string | null | Promise<string | null>;
